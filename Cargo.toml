@@ -3,6 +3,10 @@ name = "stevio_code"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "sc"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5.39", features = ["derive"] }
 git2 = "0.20.2"
