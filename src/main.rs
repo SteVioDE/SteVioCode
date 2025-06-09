@@ -1,10 +1,6 @@
 use clap::Parser;
 
-use cli::Cli;
-
-mod cli;
-mod commands;
-mod config;
+use stevio_code::{cli::Cli, commands, config};
 
 fn main() {
     let cli = Cli::parse();

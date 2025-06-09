@@ -1,192 +1,22 @@
-use std::{
-    collections::HashSet,
-    fmt::{Display, Formatter},
-    path::{Path, PathBuf},
-};
-
-use crate::{cli::ProjectCommands, config::Config};
-use walkdir::WalkDir;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ProjectType {
-    Git,
-    Rust,
-    Java,
-    Go,
-}
-
-impl Display for ProjectType {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ProjectType::Git => write!(f, "Git"),
-            ProjectType::Rust => write!(f, "Rust"),
-            ProjectType::Java => write!(f, "Java"),
-            ProjectType::Go => write!(f, "Go"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ProjectInfo {
-    path: PathBuf,
-    project_types: HashSet<ProjectType>,
-}
-
-impl ProjectInfo {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            project_types: HashSet::new(),
-        }
-    }
-
-    fn add_type(&mut self, project_type: ProjectType) {
-        self.project_types.insert(project_type);
-    }
-
-    fn has_type(&self, project_type: &ProjectType) -> bool {
-        self.project_types.contains(project_type)
-    }
-}
-
-trait ProjectDetector {
-    fn detect(&self, path: &Path) -> bool;
-    fn project_type(&self) -> ProjectType;
-}
-
-struct GitDetector;
-impl ProjectDetector for GitDetector {
-    fn detect(&self, path: &Path) -> bool {
-        let git_path = path.join(".git");
-        git_path.exists() && (git_path.is_dir() || git_path.is_file())
-    }
-
-    fn project_type(&self) -> ProjectType {
-        ProjectType::Git
-    }
-}
-
-struct RustDetector;
-impl ProjectDetector for RustDetector {
-    fn detect(&self, path: &Path) -> bool {
-        path.join("Cargo.toml").exists()
-    }
-
-    fn project_type(&self) -> ProjectType {
-        ProjectType::Rust
-    }
-}
-
-pub struct JavaDetector;
-impl ProjectDetector for JavaDetector {
-    fn detect(&self, path: &Path) -> bool {
-        path.join("pom.xml").exists()
-            || path.join("build.gradle").exists()
-            || path.join("build.gradle.kts").exists()
-    }
-
-    fn project_type(&self) -> ProjectType {
-        ProjectType::Java
-    }
-}
-
-pub struct GoDetector;
-impl ProjectDetector for GoDetector {
-    fn detect(&self, path: &Path) -> bool {
-        path.join("go.mod").exists()
-    }
-
-    fn project_type(&self) -> ProjectType {
-        ProjectType::Go
-    }
-}
-
-struct ProjectScanner {
-    detectors: Vec<Box<dyn ProjectDetector>>,
-}
-
-impl ProjectScanner {
-    fn new() -> Self {
-        Self {
-            detectors: vec![
-                Box::new(GitDetector),
-                Box::new(RustDetector),
-                Box::new(JavaDetector),
-                Box::new(GoDetector),
-            ],
-        }
-    }
-
-    // fn with_detectors(detectors: Vec<Box<dyn ProjectDetector>>) -> Self {
-    //     Self { detectors }
-    // }
-
-    fn detect_projects(&self, path: &Path) -> Option<ProjectInfo> {
-        let mut project_info = ProjectInfo::new(path.to_path_buf());
-        let mut found_any = false;
-        for detector in &self.detectors {
-            if detector.detect(path) {
-                project_info.add_type(detector.project_type());
-                found_any = true;
-            }
-        }
-
-        if found_any { Some(project_info) } else { None }
-    }
-
-    fn should_skip_recursion(&self, project_info: &ProjectInfo) -> bool {
-        project_info.has_type(&ProjectType::Git)
-    }
-}
-
-fn find_folders<P: AsRef<Path>>(
-    root_path: P,
-    scanner: &ProjectScanner,
-) -> Result<Vec<ProjectInfo>, Box<dyn std::error::Error>> {
-    let mut projects = Vec::new();
-    let mut skip_depth = None;
-
-    for entry in WalkDir::new(root_path).into_iter() {
-        let entry = entry?;
-        let depth = entry.depth();
-
-        if let Some(skip_until_depth) = skip_depth {
-            if depth > skip_until_depth {
-                continue;
-            } else {
-                skip_depth = None;
-            }
-        }
-
-        if entry.file_type().is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with('.') && name != ".git" {
-                    continue;
-                }
-            }
-
-            if let Some(project_info) = scanner.detect_projects(entry.path()) {
-                if scanner.should_skip_recursion(&project_info) {
-                    skip_depth = Some(depth);
-                }
-                projects.push(project_info);
-            }
-        }
-    }
-    Ok(projects)
-}
+use crate::prelude::*;
 
 pub fn handle(
-    project_command: Option<ProjectCommands>,
+    project_command: ProjectCommands,
     config: Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{:?}", project_command);
-    println!("{:?}", config);
+    match project_command {
+        ProjectCommands::List => {
+            list_projects(config)?;
+        }
+    }
+    Ok(())
+}
 
-    let scanner = ProjectScanner::new();
-    let projects = find_folders(&config.projects_path, &scanner)?;
+fn list_projects(config: Config) -> Result<Vec<ProjectInfo>, Box<dyn std::error::Error>> {
+    let pm = ProjectManager::new(config);
+    let projects = pm.scan_projects()?;
 
-    for project in projects {
+    for project in &projects {
         let types: Vec<String> = project
             .project_types
             .iter()
@@ -194,5 +24,124 @@ pub fn handle(
             .collect();
         println!("{} [{}]", project.path.display(), types.join(", "));
     }
-    Ok(())
+    Ok(projects)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn create_test_config(temp_dir: &TempDir) -> Config {
+        Config {
+            projects_path: temp_dir.path().to_string_lossy().to_string(),
+        }
+    }
+
+    fn create_test_project_structure(temp_dir: &TempDir) -> Result<(), std::io::Error> {
+        let base_path = temp_dir.path();
+
+        let rust_project = base_path.join("rust_project");
+        fs::create_dir_all(&rust_project)?;
+        fs::write(rust_project.join("Cargo.toml"), "")?;
+
+        let git_project = base_path.join("git_project");
+        fs::create_dir_all(&git_project)?;
+        fs::create_dir_all(git_project.join(".git"))?;
+
+        let go_project = base_path.join("go_project");
+        fs::create_dir_all(&go_project)?;
+        fs::write(go_project.join("go.mod"), "")?;
+
+        let maven_project = base_path.join("maven_project");
+        fs::create_dir_all(&maven_project)?;
+        fs::write(maven_project.join("pom.xml"), "")?;
+
+        let gradle_project = base_path.join("gradle_project");
+        fs::create_dir_all(&gradle_project)?;
+        fs::write(gradle_project.join("build.gradle"), "")?;
+
+        let multi_project = base_path.join("multi_project");
+        fs::create_dir_all(&multi_project)?;
+        fs::write(multi_project.join("Cargo.toml"), "")?;
+        fs::create_dir_all(multi_project.join(".git"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_list_command() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        create_test_project_structure(&temp_dir).expect("Failed to create test structure");
+        let config = create_test_config(&temp_dir);
+
+        let result = handle(ProjectCommands::List, config);
+        assert!(result.is_ok(), "handle should succeed for List command");
+    }
+
+    #[test]
+    fn test_list_projects_basic() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        create_test_project_structure(&temp_dir).expect("Failed to create test structure");
+        let config = create_test_config(&temp_dir);
+
+        let result = list_projects(config);
+        assert!(result.is_ok(), "list_projects should succeed");
+
+        let projects = result.unwrap();
+        assert!(!projects.is_empty(), "Should find at least one project");
+
+        let project_paths: Vec<String> = projects
+            .iter()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert!(project_paths.contains(&"rust_project".to_string()));
+        assert!(project_paths.contains(&"git_project".to_string()));
+        assert!(project_paths.contains(&"go_project".to_string()));
+        assert!(project_paths.contains(&"maven_project".to_string()));
+        assert!(project_paths.contains(&"gradle_project".to_string()));
+        assert!(project_paths.contains(&"multi_project".to_string()));
+    }
+
+    #[test]
+    fn test_list_projects_with_types() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        create_test_project_structure(&temp_dir).expect("Failed to create test structure");
+        let config = create_test_config(&temp_dir);
+
+        let projects = list_projects(config).expect("list_projects should succeed");
+
+        let multi_project = projects
+            .iter()
+            .find(|p| p.path.file_name().unwrap() == "multi_project")
+            .expect("Should find multi_project");
+
+        assert!(multi_project.has_type(&ProjectType::Rust));
+        assert!(multi_project.has_type(&ProjectType::Git));
+
+        let rust_project = projects
+            .iter()
+            .find(|p| p.path.file_name().unwrap() == "rust_project")
+            .expect("Should find rust_project");
+
+        assert!(rust_project.has_type(&ProjectType::Rust));
+        assert!(!rust_project.has_type(&ProjectType::Git));
+    }
+
+    #[test]
+    fn test_list_projects_nonexistent_directory() {
+        let config = Config {
+            projects_path: "/not/existent/directory".to_string(),
+        };
+
+        let result = list_projects(config);
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent directory"
+        );
+    }
 }

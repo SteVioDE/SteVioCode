@@ -11,9 +11,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// handles projects
+    #[command(alias = "p")]
     Projects {
         #[command(subcommand)]
-        project_commands: Option<ProjectCommands>,
+        project_commands: ProjectCommands,
     },
 }
 
